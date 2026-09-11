@@ -12,6 +12,7 @@ const ALLOWED_AREAS = new Set(['home', 'plan', 'buy', 'actualise', 'traffic', 'a
 const ALLOWED_TRIGGERS = new Set(['startup', 'route-change', 'mutation', 'retry', 'user-action', 'scheduled', 'manual']);
 const ALLOWED_FAILURE_KINDS = new Set(['timeout', 'network', 'missing-dom', 'stale-extension-context', 'permission', 'unexpected']);
 const ALLOWED_REASONS = new Set(['approval-tracking-disabled', 'no-pending-campaigns']);
+const ALLOWED_MEDIA_TYPES = new Set(['digital', 'print', 'tv', 'radio', 'audio', 'ooh', 'cinema', 'social', 'video']);
 const ALLOWED_DETAIL_KEYS = new Set([
     'approvedTransitions',
     'checkedCount',
@@ -21,7 +22,13 @@ const ALLOWED_DETAIL_KEYS = new Set([
     'pendingCount',
     'sampleCount',
     'totalDurationMs',
-    'maxDurationMs'
+    'maxDurationMs',
+    'promptInsertedAt',
+    'optionListInsertedAt',
+    'optionSelectedAt',
+    'sendClickedAt',
+    'promptToOptionMs',
+    'optionToSendMs'
 ]);
 
 let writeQueue = Promise.resolve();
@@ -49,6 +56,11 @@ function cleanDetails(details) {
     if (!details || typeof details !== 'object' || Array.isArray(details)) return undefined;
     const clean = {};
     for (const [key, value] of Object.entries(details)) {
+        if (key === 'mediaType') {
+            const mediaType = cleanAllowedValue(value, ALLOWED_MEDIA_TYPES);
+            if (mediaType) clean.mediaType = mediaType;
+            continue;
+        }
         if (!ALLOWED_DETAIL_KEYS.has(key)) continue;
         const numericValue = Number(value);
         if (Number.isFinite(numericValue)) clean[key] = Math.max(0, Math.round(numericValue));

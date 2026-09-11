@@ -11,7 +11,10 @@
     const CHAT_FRAME_SELECTOR = [
         'iframe[name="Messaging window"]',
         'iframe[title*="messaging" i]',
-        'iframe[title*="chat" i]'
+        'iframe[title*="chat" i]',
+        '#webWidget',
+        'iframe#webWidget',
+        'iframe[name="webWidget"]'
     ].join(',');
     const MEDIA_ICON_LABELS = Object.freeze({
         digital: 'Digital',
@@ -26,7 +29,15 @@
         social: 'Social',
         video: 'Video'
     });
-    const PLACEHOLDER_VALUES = new Set(['', '-', 'select media', 'select']);
+    const PLACEHOLDER_VALUES = new Set([
+        '',
+        '-',
+        'select media',
+        'select',
+        'select...',
+        'choose media',
+        'choose'
+    ]);
 
     let initialized = false;
     let enabled = false;
@@ -34,8 +45,14 @@
     let observedRoots = new Map();
     let openingControls = new WeakSet();
     let pendingActions = new WeakSet();
+    let completedControls = new WeakSet();
+    let pendingSendRequests = new Map();
     let pendingScanTimers = new Set();
-    const MAX_SEND_ATTEMPTS = 8;
+    let attachedFrameListeners = new Map();
+    let controlTimings = new WeakMap();
+    let lastTimings = null;
+    let cachedMediaIcon = null;
+    let cachedMediaType = null;
 
     function normalize(value) {
         return String(value || '')
@@ -44,13 +61,26 @@
             .toLowerCase();
     }
 
+    function getNow() {
+        return window.opsDiagnostics?.now?.() ?? Date.now();
+    }
+
     function getCampaignMediaType() {
         if (typeof document === 'undefined' || !document.querySelectorAll) return null;
         const icons = Array.from(document.querySelectorAll(MEDIA_ICON_SELECTOR));
         for (const icon of icons) {
             const name = normalize(icon.getAttribute('name'));
-            if (MEDIA_ICON_LABELS[name]) return MEDIA_ICON_LABELS[name];
+            if (MEDIA_ICON_LABELS[name]) {
+                if (cachedMediaIcon === icon && cachedMediaType === MEDIA_ICON_LABELS[name]) {
+                    return cachedMediaType;
+                }
+                cachedMediaIcon = icon;
+                cachedMediaType = MEDIA_ICON_LABELS[name];
+                return cachedMediaType;
+            }
         }
+        cachedMediaIcon = null;
+        cachedMediaType = null;
         return null;
     }
 
@@ -138,7 +168,7 @@
     function findMatchingOption(root, control, mediaType) {
         const optionSelector = control.matches?.('select')
             ? 'option'
-            : '[role="option"]';
+            : '[role="option"], [data-garden-id*="option"]';
         const options = Array.from(root.querySelectorAll?.(optionSelector) || []);
         const wanted = normalize(mediaType);
         return options.find(option => {
@@ -151,9 +181,9 @@
         const controlsId = control.getAttribute?.('aria-controls');
         const triggerSelector = controlsId
             ? Array.from(control.ownerDocument?.querySelectorAll?.('[aria-controls]') || [])
-                .find(element => element.getAttribute('aria-controls') === controlsId)
+                .find(element => element !== control && element.getAttribute('aria-controls') === controlsId)
             : null;
-        return control.closest?.('[data-garden-id="dropdowns.combobox.trigger"]') ||
+        return control.closest?.('[data-garden-id="dropdowns.combobox.trigger"], [data-garden-id*="trigger"]') ||
             triggerSelector ||
             control;
     }
@@ -163,61 +193,147 @@
         openingControls.add(control);
         const trigger = findControlTrigger(control);
         try {
+            if (typeof trigger.focus === 'function') trigger.focus();
+            trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
             trigger?.click?.();
         } catch (_error) {
             // The chat may be replaced while the dropdown is opening.
         }
     }
 
+    function isSendButton(element) {
+        if (!element) return false;
+        const tag = (element.tagName || '').toLowerCase();
+        if (tag !== 'button' && element.getAttribute?.('role') !== 'button' && element.getAttribute?.('type') !== 'submit') {
+            return false;
+        }
+        return [
+            element.textContent,
+            element.getAttribute?.('aria-label'),
+            element.getAttribute?.('title'),
+            element.value
+        ].some(value => {
+            const text = normalize(value);
+            return text === 'send' || text === 'send message' || text.startsWith('send ');
+        });
+    }
+
     function findSendButton(root) {
-        return Array.from(root.querySelectorAll?.('button, [role="button"]') || [])
-            .find(button => normalize(button.textContent || button.getAttribute?.('aria-label')) === 'send') || null;
+        if (!root?.querySelectorAll) return null;
+        return Array.from(root.querySelectorAll('button, [role="button"], input[type="submit"]'))
+            .find(isSendButton) || null;
     }
 
     function isDisabled(button) {
-        return Boolean(button?.disabled || button?.hasAttribute?.('disabled') ||
-            button?.getAttribute?.('aria-disabled') === 'true');
+        if (!button) return true;
+        return Boolean(
+            button.disabled ||
+            button.hasAttribute?.('disabled') ||
+            button.getAttribute?.('aria-disabled') === 'true' ||
+            button.classList?.contains?.('is-disabled') ||
+            button.getAttribute?.('disabled') === 'disabled'
+        );
     }
 
-    function recordAction(outcome, mediaType) {
-        window.opsDiagnostics?.record?.({
+    function recordAction(outcome, mediaType, timings = {}) {
+        const details = { mediaType };
+        if (typeof timings.promptInsertedAt === 'number') details.promptInsertedAt = timings.promptInsertedAt;
+        if (typeof timings.optionListInsertedAt === 'number') details.optionListInsertedAt = timings.optionListInsertedAt;
+        if (typeof timings.optionSelectedAt === 'number') details.optionSelectedAt = timings.optionSelectedAt;
+        if (typeof timings.sendClickedAt === 'number') details.sendClickedAt = timings.sendClickedAt;
+        if (typeof timings.promptToOptionMs === 'number') details.promptToOptionMs = timings.promptToOptionMs;
+        if (typeof timings.optionToSendMs === 'number') details.optionToSendMs = timings.optionToSendMs;
+        if (typeof timings.totalDurationMs === 'number') details.totalDurationMs = timings.totalDurationMs;
+
+        const event = {
             source: 'moe-chat-media',
             operation: 'auto-select-media',
             outcome,
             trigger: 'mutation',
-            details: { mediaType }
-        });
+            details
+        };
+        if (typeof timings.totalDurationMs === 'number') event.durationMs = timings.totalDurationMs;
+        window.opsDiagnostics?.record?.(event);
     }
 
-    function scheduleSendAttempt(control, root, mediaType, attempt = 0) {
+    function getOrCreateTimings(control) {
+        let timings = controlTimings.get(control);
+        if (!timings) {
+            timings = {
+                promptInsertedAt: getNow(),
+                optionListInsertedAt: null,
+                optionSelectedAt: null,
+                sendClickedAt: null
+            };
+            controlTimings.set(control, timings);
+        }
+        return timings;
+    }
+
+    function trySend(request) {
+        if (!enabled || !request.control.isConnected) {
+            pendingSendRequests.delete(request.control);
+            pendingActions.delete(request.control);
+            return false;
+        }
+
+        if (completedControls.has(request.control) || request.control.dataset?.[ACTION_MARKER] === 'true') {
+            pendingSendRequests.delete(request.control);
+            pendingActions.delete(request.control);
+            return false;
+        }
+
+        const sendButton = findSendButton(request.root);
+        if (sendButton && !isDisabled(sendButton)) {
+            completedControls.add(request.control);
+            request.control.dataset[ACTION_MARKER] = 'true';
+            pendingSendRequests.delete(request.control);
+            pendingActions.delete(request.control);
+
+            request.timings.sendClickedAt = getNow();
+            if (request.timings.optionSelectedAt) {
+                request.timings.optionToSendMs = Math.max(0, Math.round(request.timings.sendClickedAt - request.timings.optionSelectedAt));
+            }
+            if (request.timings.promptInsertedAt) {
+                request.timings.totalDurationMs = Math.max(0, Math.round(request.timings.sendClickedAt - request.timings.promptInsertedAt));
+            }
+            lastTimings = { ...request.timings };
+
+            sendButton.click();
+            recordAction('success', request.mediaType, request.timings);
+            return true;
+        }
+        return false;
+    }
+
+    function scheduleSendAttempt(request) {
         const timer = setTimeout(() => {
             pendingScanTimers.delete(timer);
-            if (!enabled || !control.isConnected) {
-                pendingActions.delete(control);
+            if (!enabled || !request.control.isConnected) {
+                pendingSendRequests.delete(request.control);
+                pendingActions.delete(request.control);
                 return;
             }
 
-            const sendButton = findSendButton(root);
-            if (sendButton && !isDisabled(sendButton)) {
-                control.dataset[ACTION_MARKER] = 'true';
-                pendingActions.delete(control);
-                sendButton.click();
-                recordAction('success', mediaType);
-                return;
-            }
+            if (trySend(request)) return;
 
-            if (attempt + 1 < MAX_SEND_ATTEMPTS) {
-                scheduleSendAttempt(control, root, mediaType, attempt + 1);
-            } else {
-                pendingActions.delete(control);
-            }
+            // Wait for a DOM mutation so Send is dispatched as soon as the framework enables it.
+            request.waitingForEnable = true;
         }, 0);
         pendingScanTimers.add(timer);
     }
 
-    function selectAndSend(control, option, root, mediaType) {
-        if (pendingActions.has(control) || control.dataset?.[ACTION_MARKER] === 'true') return;
+    function selectAndSend(control, option, root, mediaType, timings) {
+        if (
+            completedControls.has(control) ||
+            pendingActions.has(control) ||
+            control.dataset?.[ACTION_MARKER] === 'true'
+        ) {
+            return;
+        }
         pendingActions.add(control);
+
+        timings.optionSelectedAt = getNow();
 
         try {
             if (control.matches?.('select')) {
@@ -225,6 +341,7 @@
                 control.dispatchEvent(new Event('input', { bubbles: true }));
                 control.dispatchEvent(new Event('change', { bubbles: true }));
             } else {
+                option.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
                 option.click?.();
             }
         } catch (_error) {
@@ -232,45 +349,143 @@
             return;
         }
 
-        // Let the control's own change handler commit first, then send on the
-        // next task. This avoids an arbitrary visible pause while still
-        // tolerating a framework-rendered Send button.
-        scheduleSendAttempt(control, root, mediaType);
+        const request = { control, root, mediaType, timings, waitingForEnable: false };
+        pendingSendRequests.set(control, request);
+
+        // Queue Send on the next task to let the selection change event commit,
+        // while also registering for instant mutation dispatch once ready.
+        scheduleSendAttempt(request);
     }
 
     function scanRoot(root) {
         if (!enabled || !root?.querySelectorAll || typeof document === 'undefined') return;
+
+        // Check pending send actions that are waiting for enable
+        for (const request of Array.from(pendingSendRequests.values())) {
+            if (request.root === root && request.waitingForEnable) {
+                trySend(request);
+            }
+        }
+
         const mediaType = getCampaignMediaType();
         if (!mediaType) return;
 
         getMediaControls(root).forEach(control => {
+            if (
+                completedControls.has(control) ||
+                pendingActions.has(control) ||
+                control.dataset?.[ACTION_MARKER] === 'true'
+            ) {
+                return;
+            }
             if (!isPlaceholderControl(control)) return;
 
+            const timings = getOrCreateTimings(control);
             const option = findMatchingOption(root, control, mediaType);
             if (option) {
+                if (!timings.optionListInsertedAt) timings.optionListInsertedAt = getNow();
+                if (timings.promptInsertedAt) {
+                    timings.promptToOptionMs = Math.max(0, Math.round(timings.optionListInsertedAt - timings.promptInsertedAt));
+                }
                 openingControls.delete(control);
-                selectAndSend(control, option, root, mediaType);
+                selectAndSend(control, option, root, mediaType, timings);
             } else {
                 openControl(control);
+                // If opening mounted options synchronously, select and send immediately
+                const immediateOption = findMatchingOption(root, control, mediaType);
+                if (immediateOption) {
+                    timings.optionListInsertedAt = getNow();
+                    if (timings.promptInsertedAt) {
+                        timings.promptToOptionMs = Math.max(0, Math.round(timings.optionListInsertedAt - timings.promptInsertedAt));
+                    }
+                    openingControls.delete(control);
+                    selectAndSend(control, immediateOption, root, mediaType, timings);
+                } else if (typeof queueMicrotask === 'function') {
+                    queueMicrotask(() => {
+                        if (!enabled || !control.isConnected || pendingActions.has(control) || completedControls.has(control)) return;
+                        const microOption = findMatchingOption(root, control, mediaType);
+                        if (microOption) {
+                            timings.optionListInsertedAt = getNow();
+                            if (timings.promptInsertedAt) {
+                                timings.promptToOptionMs = Math.max(0, Math.round(timings.optionListInsertedAt - timings.promptInsertedAt));
+                            }
+                            openingControls.delete(control);
+                            selectAndSend(control, microOption, root, mediaType, timings);
+                        }
+                    });
+                }
             }
         });
     }
 
     function observeRoot(root) {
         if (!root || observedRoots.has(root) || typeof MutationObserver !== 'function') return;
-        const observer = new MutationObserver(() => scanRoot(root));
+        const observer = new MutationObserver(mutations => {
+            const hasChildListMutation = mutations.some(mutation => mutation.type === 'childList');
+            const hasPendingSendMutation = mutations.some(mutation =>
+                mutation.type === 'attributes' &&
+                ['disabled', 'aria-disabled', 'class'].includes(mutation.attributeName) &&
+                isSendButton(mutation.target)
+            );
+
+            if (hasChildListMutation || hasPendingSendMutation) {
+                for (const request of Array.from(pendingSendRequests.values())) {
+                    if (request.root === root && request.waitingForEnable) {
+                        trySend(request);
+                    }
+                }
+            }
+
+            const shouldScan = mutations.some(mutation =>
+                mutation.type === 'childList' ||
+                (mutation.type === 'attributes' &&
+                    ['aria-expanded', 'aria-selected', 'hidden', 'value'].includes(mutation.attributeName))
+            );
+            if (shouldScan) scanRoot(root);
+
+            if (hasChatFrameMutation(mutations)) {
+                const roots = collectChatRoots();
+                roots.forEach(observeRoot);
+                roots.forEach(scanRoot);
+            }
+        });
         const target = root.documentElement || root;
         observer.observe(target, {
             childList: true,
             subtree: true,
             attributes: true,
-            attributeFilter: ['aria-expanded', 'aria-selected', 'hidden', 'value']
+            attributeFilter: [
+                'aria-expanded',
+                'aria-selected',
+                'aria-disabled',
+                'disabled',
+                'hidden',
+                'value',
+                'class'
+            ]
         });
         observedRoots.set(root, observer);
         scanRoot(root);
     }
 
+    function attachFrameListeners(frame) {
+        if (!frame || attachedFrameListeners.has(frame)) return;
+        const onLoad = () => {
+            if (!enabled) return;
+            const roots = collectChatRoots();
+            roots.forEach(observeRoot);
+            roots.forEach(scanRoot);
+        };
+        try {
+            frame.addEventListener('load', onLoad, { passive: true });
+            attachedFrameListeners.set(frame, onLoad);
+        } catch (_error) {
+            // Cross-origin frame listener restriction
+        }
+    }
+
     function collectChatRoots() {
+        if (typeof document === 'undefined' || !document.querySelectorAll) return [];
         const roots = [];
         const visited = new Set();
         const visit = root => {
@@ -278,6 +493,7 @@
             visited.add(root);
             roots.push(root);
             root.querySelectorAll?.('iframe').forEach(frame => {
+                attachFrameListeners(frame);
                 try {
                     if (frame.contentDocument) visit(frame.contentDocument);
                 } catch (_error) {
@@ -287,6 +503,7 @@
         };
 
         document.querySelectorAll(CHAT_FRAME_SELECTOR).forEach(frame => {
+            attachFrameListeners(frame);
             try {
                 if (frame.contentDocument) visit(frame.contentDocument);
             } catch (_error) {
@@ -318,6 +535,7 @@
         parentObserver = new MutationObserver(mutations => {
             if (!hasChatFrameMutation(mutations)) return;
             collectChatRoots().forEach(observeRoot);
+            collectChatRoots().forEach(scanRoot);
         });
         parentObserver.observe(document.documentElement, { childList: true, subtree: true });
         collectChatRoots().forEach(observeRoot);
@@ -330,8 +548,22 @@
         observedRoots = new Map();
         pendingScanTimers.forEach(timer => clearTimeout(timer));
         pendingScanTimers.clear();
+        pendingSendRequests.clear();
         openingControls = new WeakSet();
         pendingActions = new WeakSet();
+        completedControls = new WeakSet();
+        attachedFrameListeners.forEach((listener, frame) => {
+            try {
+                frame.removeEventListener('load', listener);
+            } catch (_error) {
+                // The frame may have been removed while the feature was stopping.
+            }
+        });
+        attachedFrameListeners.clear();
+        controlTimings = new WeakMap();
+        lastTimings = null;
+        cachedMediaIcon = null;
+        cachedMediaType = null;
     }
 
     function setEnabled(nextEnabled) {
@@ -357,6 +589,12 @@
     window.moeChatMediaAutoSelectFeature = {
         initialize,
         scan: () => collectChatRoots().forEach(scanRoot),
-        getCampaignMediaType
+        getCampaignMediaType,
+        getLastTimings: () => (lastTimings ? { ...lastTimings } : null),
+        resetCache: () => {
+            cachedMediaIcon = null;
+            cachedMediaType = null;
+            lastTimings = null;
+        }
     };
 })();

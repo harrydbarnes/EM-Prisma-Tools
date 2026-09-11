@@ -142,4 +142,120 @@ describe('Moe chat media auto-select', () => {
         expect(page.sendCount).toBe(0);
         page.dom.window.close();
     });
+
+    test('detects Print campaign icon, selects Print option, and sends automatically', () => {
+        jest.useFakeTimers();
+        const page = createPage({ media: 'print', options: ['Digital', 'Print'] });
+
+        expect(page.window.moeChatMediaAutoSelectFeature.getCampaignMediaType()).toBe('Print');
+        page.window.moeChatMediaAutoSelectFeature.scan();
+        jest.runAllTimers();
+
+        expect(page.chatDocument.getElementById('media-input').value).toBe('Print');
+        expect(page.sendCount).toBe(1);
+        expect(page.window.opsDiagnostics.record).toHaveBeenCalledWith(expect.objectContaining({
+            source: 'moe-chat-media',
+            operation: 'auto-select-media',
+            outcome: 'success',
+            details: expect.objectContaining({
+                mediaType: 'Print'
+            })
+        }));
+        page.dom.window.close();
+    });
+
+    test('refreshes campaign media when Prisma swaps the icon without changing the URL', () => {
+        const page = createPage({ media: 'digital' });
+        const icon = page.window.document.querySelector('#ptb-header mo-icon');
+
+        expect(page.window.moeChatMediaAutoSelectFeature.getCampaignMediaType()).toBe('Digital');
+        icon.setAttribute('name', 'print');
+        expect(page.window.moeChatMediaAutoSelectFeature.getCampaignMediaType()).toBe('Print');
+
+        icon.remove();
+        expect(page.window.moeChatMediaAutoSelectFeature.getCampaignMediaType()).toBeNull();
+        page.window.moeChatMediaAutoSelectFeature.resetCache();
+        expect(page.window.moeChatMediaAutoSelectFeature.getLastTimings()).toBeNull();
+        page.dom.window.close();
+    });
+
+    test('captures timestamps for prompt, option list, option selection, and send click in diagnostics and feature API', () => {
+        jest.useFakeTimers();
+        const page = createPage({ media: 'digital' });
+
+        page.window.moeChatMediaAutoSelectFeature.scan();
+        jest.runAllTimers();
+
+        const lastTimings = page.window.moeChatMediaAutoSelectFeature.getLastTimings();
+        expect(lastTimings).not.toBeNull();
+        expect(typeof lastTimings.promptInsertedAt).toBe('number');
+        expect(typeof lastTimings.optionListInsertedAt).toBe('number');
+        expect(typeof lastTimings.optionSelectedAt).toBe('number');
+        expect(typeof lastTimings.sendClickedAt).toBe('number');
+        expect(lastTimings.sendClickedAt).toBeGreaterThanOrEqual(lastTimings.optionSelectedAt);
+        expect(lastTimings.optionSelectedAt).toBeGreaterThanOrEqual(lastTimings.promptInsertedAt);
+
+        expect(page.window.opsDiagnostics.record).toHaveBeenCalledWith(expect.objectContaining({
+            source: 'moe-chat-media',
+            operation: 'auto-select-media',
+            outcome: 'success',
+            details: expect.objectContaining({
+                mediaType: 'Digital',
+                promptInsertedAt: expect.any(Number),
+                optionListInsertedAt: expect.any(Number),
+                optionSelectedAt: expect.any(Number),
+                sendClickedAt: expect.any(Number),
+                totalDurationMs: expect.any(Number)
+            })
+        }));
+        page.dom.window.close();
+    });
+
+    test('triggers send on mutation when Send button was initially disabled', async () => {
+        jest.useFakeTimers();
+        const page = createPage();
+        const sendBtn = page.chatDocument.getElementById('send');
+        sendBtn.setAttribute('disabled', 'true');
+
+        // Open options and scan
+        page.chatDocument.getElementById('media-trigger').click();
+        page.window.moeChatMediaAutoSelectFeature.scan();
+
+        // Advance task 0
+        jest.advanceTimersByTime(0);
+        // Button was disabled, so send not yet clicked
+        expect(page.sendCount).toBe(0);
+        expect(jest.getTimerCount()).toBe(0);
+
+        // React re-renders and enables the Send button (removing disabled attribute)
+        sendBtn.removeAttribute('disabled');
+
+        // Allow microtask (MutationObserver callback) to run
+        await Promise.resolve();
+
+        expect(page.sendCount).toBe(1);
+        page.dom.window.close();
+    });
+
+    test('does not send if setting is toggled off while awaiting Send button to enable', async () => {
+        jest.useFakeTimers();
+        const page = createPage();
+        const sendBtn = page.chatDocument.getElementById('send');
+        sendBtn.setAttribute('disabled', 'true');
+
+        page.chatDocument.getElementById('media-trigger').click();
+        page.window.moeChatMediaAutoSelectFeature.scan();
+        jest.advanceTimersByTime(0);
+
+        // Turn off setting
+        page.storageListener({ moeChatMediaAutoSelectEnabled: { newValue: false } }, 'sync');
+
+        // Button enables after feature was disabled
+        sendBtn.removeAttribute('disabled');
+        await Promise.resolve();
+        jest.runAllTimers();
+
+        expect(page.sendCount).toBe(0);
+        page.dom.window.close();
+    });
 });

@@ -106,6 +106,50 @@ describe('Diagnostics manager', () => {
         }]);
     });
 
+    test('retains safe Moe media and timing details in diagnostic exports', async () => {
+        const now = Date.parse('2026-09-10T10:00:00Z');
+        await diagnostics.enableDiagnostics(now);
+
+        await diagnostics.recordDiagnosticEvent({
+            source: 'moe-chat-media',
+            operation: 'auto-select-media',
+            outcome: 'success',
+            trigger: 'mutation',
+            durationMs: 18.4,
+            details: {
+                mediaType: 'Digital',
+                promptInsertedAt: 100,
+                optionListInsertedAt: 105,
+                optionSelectedAt: 106,
+                sendClickedAt: 118,
+                promptToOptionMs: 5,
+                optionToSendMs: 12,
+                totalDurationMs: 18,
+                message: 'must not be retained'
+            }
+        }, now + 1000);
+
+        expect(localStore.diagnosticEvents).toEqual([{
+            timestamp: '2026-09-10T10:00:01.000Z',
+            source: 'moe-chat-media',
+            operation: 'auto-select-media',
+            outcome: 'success',
+            area: 'other',
+            durationMs: 18,
+            trigger: 'mutation',
+            details: {
+                mediaType: 'digital',
+                promptInsertedAt: 100,
+                optionListInsertedAt: 105,
+                optionSelectedAt: 106,
+                sendClickedAt: 118,
+                promptToOptionMs: 5,
+                optionToSendMs: 12,
+                totalDurationMs: 18
+            }
+        }]);
+    });
+
     test('keeps a bounded rolling event log', async () => {
         const now = Date.parse('2026-09-10T10:00:00Z');
         await diagnostics.enableDiagnostics(now);
