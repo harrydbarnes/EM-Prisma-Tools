@@ -372,12 +372,12 @@
         title.textContent = 'Campaign Approvals';
         titleGroup.appendChild(title);
 
-        const badge = document.createElement('span');
-        badge.className = 'toolshed-approval-panel-badge';
-        badge.textContent = totalCount === 0
-            ? 'Campaign Approvals'
-            : `${approvedCount}/${totalCount} Approved`;
-        titleGroup.appendChild(badge);
+        if (totalCount > 0) {
+            const badge = document.createElement('span');
+            badge.className = 'toolshed-approval-panel-badge';
+            badge.textContent = `${approvedCount}/${totalCount} Approved`;
+            titleGroup.appendChild(badge);
+        }
         header.appendChild(titleGroup);
 
         const actions = document.createElement('div');
@@ -678,6 +678,7 @@
                             submittedAt: Date.now()
                         }
                     });
+                    checkLiveWorkflowWidget();
                     await updateBannerIndicator();
                     if (isExtensionContextValid()) {
                         renderApprovalPanel(anchor);
@@ -1054,12 +1055,13 @@
                     const pending = data[PENDING_STORAGE_KEY] || {};
                     const approvedList = data[APPROVED_STORAGE_KEY] || [];
                     if (pending[campaignId]) {
+                        const pendingRecord = pending[campaignId];
                         delete pending[campaignId];
                         const record = {
                             campaignId: campaignId,
                             campaignName: getCampaignName() || campaignId,
                             url: window.location.href,
-                            submittedAt: pending[campaignId].submittedAt || Date.now(),
+                            submittedAt: pendingRecord.submittedAt || Date.now(),
                             approvedAt: Date.now()
                         };
                         const existingIdx = approvedList.findIndex(function(item) { return item.campaignId === campaignId; });
@@ -1073,6 +1075,9 @@
                             if (!isExtensionContextValid()) return;
                             showApprovalToast(record);
                             updateBannerIndicator();
+                            if (currentPanel && bannerButton) {
+                                renderApprovalPanel(bannerButton, { reuseCurrent: true });
+                            }
                         });
                     }
                 });
@@ -1182,6 +1187,9 @@
             if (request.action === 'campaignApproved' && request.campaign) {
                 showApprovalToast(request.campaign);
                 updateBannerIndicator();
+                if (currentPanel && bannerButton) {
+                    renderApprovalPanel(bannerButton, { reuseCurrent: true });
+                }
             }
         });
 

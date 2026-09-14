@@ -341,6 +341,12 @@ describe('Approval Tracking Content Script UI', () => {
         expect(btn).not.toBeNull();
         expect(btn.textContent).toContain('Campaign Approvals');
         expect(btn.classList.contains('is-none-tracked')).toBe(true);
+
+        btn.click();
+        await new Promise(r => setTimeout(r, 10));
+        const panel = document.querySelector('.toolshed-approval-panel');
+        expect(panel.querySelector('.toolshed-approval-panel-title').textContent).toBe('Campaign Approvals');
+        expect(panel.querySelector('.toolshed-approval-panel-badge')).toBeNull();
     });
 
     test('does not inject banner button when approvalBannerIndicatorEnabled is false', async () => {
@@ -413,6 +419,34 @@ describe('Approval Tracking Content Script UI', () => {
         expect(detect('NOT_SUBMITTED')).toBe('not-submitted');
         expect(detect('NOT-APPROVED')).toBe('not-approved');
         expect(detect('DRAFT')).toBe('unknown');
+    });
+
+    test('immediately resolves an already-approved campaign tracked from Orders', async () => {
+        document.querySelector('.workflow-widget-wrapper').textContent = 'APPROVED';
+        window.chrome.runtime.sendMessage.mockImplementation(async msg => {
+            runtimeMessages.push(msg);
+            if (msg.action === 'trackCampaignApproval') {
+                localData[PENDING_APPROVAL_KEY] = {
+                    [msg.campaign.campaignId]: { ...msg.campaign, lastChecked: Date.now() }
+                };
+            }
+            return { status: 'success' };
+        });
+
+        window.approvalTrackingFeature.initialize();
+        await new Promise(r => setTimeout(r, 15));
+        document.querySelector('.toolshed-approval-banner-button').click();
+        await new Promise(r => setTimeout(r, 15));
+        document.querySelector('.toolshed-approval-track-current-btn').click();
+        await new Promise(r => setTimeout(r, 30));
+
+        expect(localData[PENDING_APPROVAL_KEY].CP3GQJ6).toBeUndefined();
+        expect(localData[APPROVED_CAMPAIGNS_KEY]).toEqual([
+            expect.objectContaining({ campaignId: 'CP3GQJ6' })
+        ]);
+        const panel = document.querySelector('.toolshed-approval-panel');
+        expect(panel.querySelector('.toolshed-approval-panel-badge').textContent).toBe('1/1 Approved');
+        expect(panel.textContent).toContain('Approved Campaigns (1)');
     });
 
     test('renders approval panel with Approved and Pending sections', async () => {
