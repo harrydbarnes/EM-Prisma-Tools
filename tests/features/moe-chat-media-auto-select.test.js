@@ -258,4 +258,76 @@ describe('Moe chat media auto-select', () => {
         expect(page.sendCount).toBe(0);
         page.dom.window.close();
     });
+
+    test('reconnects to an existing chat frame when Moe replaces its document after the launcher click', () => {
+        jest.useFakeTimers();
+        const dom = new JSDOM(`<!doctype html><html><body>
+            <div id="ptb-header"><mo-icon name="digital"></mo-icon></div>
+            <button id="launch-moe-btn" type="button">Connect with Moe</button>
+            <iframe name="Messaging window"></iframe>
+        </body></html>`, {
+            url: 'https://groupmuk-prisma.mediaocean.com/campaign-management/#campaign-id=CP123',
+            runScripts: 'outside-only'
+        });
+        const { window } = dom;
+        const frame = window.document.querySelector('iframe');
+        let activeDocument = null;
+        Object.defineProperty(frame, 'contentDocument', {
+            configurable: true,
+            get: () => activeDocument
+        });
+
+        const chatDom = new JSDOM('<!doctype html><html><body></body></html>', {
+            url: 'https://groupmuk-prisma.mediaocean.com/messaging',
+            runScripts: 'outside-only'
+        });
+        const chatDocument = chatDom.window.document;
+        chatDocument.body.innerHTML = `
+            <div data-garden-id="containers.field">
+                <label>Media</label>
+                <input id="media-input" role="combobox" aria-label="Media" value="-">
+            </div>
+            <button id="send" type="button">Send</button>
+        `;
+        const input = chatDocument.getElementById('media-input');
+        const sendButton = chatDocument.getElementById('send');
+        let sendCount = 0;
+        sendButton.addEventListener('click', () => { sendCount += 1; });
+        input.addEventListener('click', () => {
+            if (chatDocument.getElementById('media-listbox')) return;
+            const listbox = chatDocument.createElement('ul');
+            listbox.id = 'media-listbox';
+            listbox.setAttribute('role', 'listbox');
+            ['Digital', 'Print'].forEach(label => {
+                const option = chatDocument.createElement('li');
+                option.setAttribute('role', 'option');
+                option.textContent = label;
+                option.addEventListener('click', () => { input.value = label; });
+                listbox.appendChild(option);
+            });
+            chatDocument.body.appendChild(listbox);
+        });
+
+        window.chrome = {
+            storage: {
+                sync: {
+                    get: jest.fn((defaults, callback) => callback({ ...defaults, moeChatMediaAutoSelectEnabled: true }))
+                }
+            }
+        };
+        window.opsDiagnostics = { record: jest.fn() };
+        window.eval(featureCode);
+        window.moeChatMediaAutoSelectFeature.initialize();
+
+        // The widget's iframe was already mounted, but its document was not
+        // available when the feature first scanned the page.
+        activeDocument = chatDocument;
+        window.document.getElementById('launch-moe-btn').click();
+        jest.runAllTimers();
+
+        expect(input.value).toBe('Digital');
+        expect(sendCount).toBe(1);
+        chatDom.window.close();
+        dom.window.close();
+    });
 });

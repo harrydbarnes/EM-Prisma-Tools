@@ -16,6 +16,19 @@
         'iframe#webWidget',
         'iframe[name="webWidget"]'
     ].join(',');
+    const CHAT_HOST_SELECTOR = [
+        CHAT_FRAME_SELECTOR,
+        '#moe-wrapper',
+        '#moe-launcher',
+        '#launcher',
+        '#launcher-button-container'
+    ].join(',');
+    const CHAT_LAUNCHER_SELECTOR = [
+        '#launch-moe-btn',
+        '#moe-restore',
+        '#launcher',
+        '#launcher-button-container'
+    ].join(',');
     const MEDIA_ICON_LABELS = Object.freeze({
         digital: 'Digital',
         print: 'Print',
@@ -48,7 +61,9 @@
     let completedControls = new WeakSet();
     let pendingSendRequests = new Map();
     let pendingScanTimers = new Set();
+    let frameSyncTimers = new Set();
     let attachedFrameListeners = new Map();
+    let launcherListener = null;
     let controlTimings = new WeakMap();
     let lastTimings = null;
     let cachedMediaIcon = null;
@@ -149,12 +164,21 @@
             return normalize(selected?.textContent || control.value);
         }
 
-        const directValue = normalize(control.value || control.getAttribute?.('value'));
-        if (directValue && !PLACEHOLDER_VALUES.has(directValue)) return directValue;
+        const directValues = [
+            control.value,
+            control.getAttribute?.('value'),
+            control.getAttribute?.('aria-valuetext')
+        ].map(normalize);
+        const directValue = directValues.find(value => value && !PLACEHOLDER_VALUES.has(value));
+        if (directValue) return directValue;
 
         const container = getControlContainer(control);
-        const valueNode = container?.querySelector?.('[data-garden-id="dropdowns.combobox.value"]');
-        return normalize(valueNode?.textContent || directValue);
+        const valueNode = container?.querySelector?.([
+            '[data-garden-id="dropdowns.combobox.value"]',
+            '[data-garden-id*="combobox.value"]',
+            '[data-garden-id*="selected-value"]'
+        ].join(','));
+        return normalize(valueNode?.textContent || directValues.find(Boolean) || '');
     }
 
     function isPlaceholderControl(control) {
@@ -444,9 +468,7 @@
             if (shouldScan) scanRoot(root);
 
             if (hasChatFrameMutation(mutations)) {
-                const roots = collectChatRoots();
-                roots.forEach(observeRoot);
-                roots.forEach(scanRoot);
+                syncChatRoots();
             }
         });
         const target = root.documentElement || root;
@@ -472,15 +494,22 @@
         if (!frame || attachedFrameListeners.has(frame)) return;
         const onLoad = () => {
             if (!enabled) return;
-            const roots = collectChatRoots();
-            roots.forEach(observeRoot);
-            roots.forEach(scanRoot);
+            syncChatRoots();
         };
         try {
             frame.addEventListener('load', onLoad, { passive: true });
             attachedFrameListeners.set(frame, onLoad);
         } catch (_error) {
             // Cross-origin frame listener restriction
+        }
+    }
+
+    function getFrameDocument(frame) {
+        try {
+            return frame?.contentDocument || frame?.contentWindow?.document || null;
+        } catch (_error) {
+            // Cross-origin chat frames are intentionally ignored.
+            return null;
         }
     }
 
@@ -494,51 +523,87 @@
             roots.push(root);
             root.querySelectorAll?.('iframe').forEach(frame => {
                 attachFrameListeners(frame);
-                try {
-                    if (frame.contentDocument) visit(frame.contentDocument);
-                } catch (_error) {
-                    // Cross-origin chat frames are intentionally ignored.
-                }
+                const frameDocument = getFrameDocument(frame);
+                if (frameDocument) visit(frameDocument);
             });
         };
 
-        document.querySelectorAll(CHAT_FRAME_SELECTOR).forEach(frame => {
-            attachFrameListeners(frame);
-            try {
-                if (frame.contentDocument) visit(frame.contentDocument);
-            } catch (_error) {
-                // Cross-origin chat frames are intentionally ignored.
+        const visitChatNode = node => {
+            if (!node) return;
+            if ((node.tagName || '').toLowerCase() === 'iframe') {
+                attachFrameListeners(node);
+                const frameDocument = getFrameDocument(node);
+                if (frameDocument) visit(frameDocument);
+                return;
             }
-        });
+            // Some widget versions use #webWidget as a host div rather than
+            // the iframe itself. Observe that host so its nested frame can be
+            // discovered when it is mounted or replaced.
+            visit(node);
+        };
+
+        document.querySelectorAll(CHAT_FRAME_SELECTOR).forEach(visitChatNode);
         return roots;
+    }
+
+    function syncChatRoots() {
+        if (!enabled) return;
+        const roots = collectChatRoots();
+        roots.forEach(observeRoot);
+        roots.forEach(scanRoot);
+    }
+
+    function scheduleChatRootSync() {
+        if (!enabled) return;
+
+        // The messaging widget can retain its iframe while replacing the
+        // document inside it. A short, finite sweep catches that transition
+        // without leaving a polling loop running for the life of the page.
+        [0, 16, 80, 200, 500, 1000, 2000, 4000, 8000].forEach(delay => {
+            const timer = setTimeout(() => {
+                frameSyncTimers.delete(timer);
+                syncChatRoots();
+            }, delay);
+            frameSyncTimers.add(timer);
+        });
+    }
+
+    function isChatHostNode(node) {
+        if (!node || node.nodeType !== 1) return false;
+        return Boolean(
+            node.matches?.(CHAT_HOST_SELECTOR) ||
+            node.closest?.(CHAT_HOST_SELECTOR) ||
+            node.querySelector?.(CHAT_HOST_SELECTOR)
+        );
     }
 
     function hasChatFrameMutation(mutations) {
         return mutations.some(mutation => {
             if (mutation.type !== 'childList') return false;
-            return Array.from(mutation.addedNodes || []).some(node =>
-                node.nodeType === 1 && (
-                    node.matches?.(CHAT_FRAME_SELECTOR) ||
-                    node.querySelector?.(CHAT_FRAME_SELECTOR)
-                )
-            );
+            return isChatHostNode(mutation.target) ||
+                Array.from(mutation.addedNodes || []).some(isChatHostNode);
         });
     }
 
     function start() {
-        if (parentObserver || typeof MutationObserver !== 'function') {
-            collectChatRoots().forEach(observeRoot);
-            collectChatRoots().forEach(scanRoot);
-            return;
+        if (!launcherListener && typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+            launcherListener = event => {
+                if (event.target?.closest?.(CHAT_LAUNCHER_SELECTOR)) {
+                    scheduleChatRootSync();
+                }
+            };
+            document.addEventListener('click', launcherListener, true);
         }
 
-        parentObserver = new MutationObserver(mutations => {
-            if (!hasChatFrameMutation(mutations)) return;
-            collectChatRoots().forEach(observeRoot);
-            collectChatRoots().forEach(scanRoot);
-        });
-        parentObserver.observe(document.documentElement, { childList: true, subtree: true });
-        collectChatRoots().forEach(observeRoot);
+        if (!parentObserver && typeof MutationObserver === 'function') {
+            parentObserver = new MutationObserver(mutations => {
+                if (!hasChatFrameMutation(mutations)) return;
+                syncChatRoots();
+                scheduleChatRootSync();
+            });
+            parentObserver.observe(document.documentElement, { childList: true, subtree: true });
+        }
+        syncChatRoots();
     }
 
     function stop() {
@@ -548,6 +613,8 @@
         observedRoots = new Map();
         pendingScanTimers.forEach(timer => clearTimeout(timer));
         pendingScanTimers.clear();
+        frameSyncTimers.forEach(timer => clearTimeout(timer));
+        frameSyncTimers.clear();
         pendingSendRequests.clear();
         openingControls = new WeakSet();
         pendingActions = new WeakSet();
@@ -560,6 +627,10 @@
             }
         });
         attachedFrameListeners.clear();
+        if (launcherListener) {
+            document.removeEventListener('click', launcherListener, true);
+            launcherListener = null;
+        }
         controlTimings = new WeakMap();
         lastTimings = null;
         cachedMediaIcon = null;
